@@ -1,125 +1,101 @@
 // music.js
-import { joinVoiceChannel, createAudioPlayer, createAudioResource, AudioPlayerStatus, VoiceConnectionStatus, entersState } from "@discordjs/voice";
-import ytdl from "ytdl-core";
-import yts from "yt-search";
+import { Player } from "discord-player";
+import { YoutubeiExtractor } from "discord-player-youtubei";
 
-// Store music queues per guild
-const guildQueues = new Map();
+// We'll initialize the player in your main bot file and pass it here
+let player;
 
-async function playNext(guildId, message) {
-  const queue = guildQueues.get(guildId);
-  if (!queue || queue.songs.length === 0) {
-    if (queue?.connection) {
-      queue.connection.destroy();
-    }
-    guildQueues.delete(guildId);
-    return;
-  }
-
-  const song = queue.songs[0];
-  const stream = ytdl(song.url, { filter: "audioonly", highWaterMark: 1 << 25 });
-  const resource = createAudioResource(stream);
-
-  queue.player.play(resource);
-  queue.connection.subscribe(queue.player);
-
-  queue.player.once(AudioPlayerStatus.Idle, () => {
-    queue.songs.shift(); // remove finished song
-    playNext(guildId, message); // play next song
-  });
-
-  message.channel.send(`🎶 Now playing: ${song.title}`);
+export function setPlayer(client) {
+  player = new Player(client);
+  player.extractors.register(YoutubeiExtractor);
 }
 
-/**
- * Add song to queue and start playing if needed
- */
+// Play music
 export async function playMusic(message, query) {
+  if (!player) return message.reply("Music player not initialized.");
+
   const voiceChannel = message.member.voice.channel;
   if (!voiceChannel) return message.reply("You must be in a voice channel!");
 
-  // Search YouTube if query is not a URL
-  let url = query;
-  let title = query;
-  if (!query.startsWith("https://")) {
-    const searchResult = await yts(query);
-    if (!searchResult || !searchResult.videos.length) {
-      return message.reply("❌ No results found.");
-    }
-    url = searchResult.videos[0].url;
-    title = searchResult.videos[0].title;
-  }
-
-  let queue = guildQueues.get(message.guild.id);
-
-  // If queue doesn't exist, create it
-  if (!queue) {
-    const connection = joinVoiceChannel({
-      channelId: voiceChannel.id,
-      guildId: message.guild.id,
-      adapterCreator: message.guild.voiceAdapterCreator,
+  try {
+    // Create or get the queue
+    const queue = player.nodes.create(message.guild, {
+      metadata: message.channel,
+      leaveOnEmpty: true,
+      leaveOnEmptyCooldown: 5000,
+      leaveOnEnd: true,
+      leaveOnEndCooldown: 5000,
     });
 
-    await entersState(connection, VoiceConnectionStatus.Ready, 30_000);
+    // Connect if not connected
+    if (!queue.connection) await queue.connect(voiceChannel);
 
-    const player = createAudioPlayer();
+    // Search for the track
+    const searchResult = await player.search(query, {
+      requestedBy: message.author,
+    });
 
-    queue = {
-      connection,
-      player,
-      songs: [],
-    };
+    if (!searchResult || !searchResult.tracks.length)
+      return message.reply("❌ No results found.");
 
-    guildQueues.set(message.guild.id, queue);
-  }
+    const track = searchResult.tracks[0];
+    queue.addTrack(track);
 
-  // Add song to queue
-  queue.songs.push({ url, title });
-
-  // If nothing is playing, start
-  if (queue.player.state.status !== AudioPlayerStatus.Playing) {
-    playNext(message.guild.id, message);
-  } else {
-    message.reply(`✅ Added to queue: ${title}`);
+    // Play the queue only if it's idle
+    if (!queue.node.isPlaying()) {
+      await queue.node.play();
+      message.channel.send(`🎶 Now playing: **${track.title}**`);
+    } else {
+      message.channel.send(`✅ Added to queue: **${track.title}**`);
+    }
+  } catch (err) {
+    console.error("Play command error:", err);
+    message.reply(`❌ Failed to play: ${err.message}`);
   }
 }
 
-// Pause, Resume, Stop functions
+// Pause
 export function pauseMusic(message) {
-  const queue = guildQueues.get(message.guild.id);
-  if (!queue) return message.reply("No song is currently playing.");
-  queue.player.pause();
+  const queue = player.nodes.get(message.guild);
+  if (!queue || !queue.node.isPlaying())
+    return message.reply("No song is currently playing.");
+  queue.node.setPaused(true);
   message.reply("⏸ Music paused!");
 }
 
+// Resume
 export function resumeMusic(message) {
-  const queue = guildQueues.get(message.guild.id);
-  if (!queue) return message.reply("No song is currently playing.");
-  queue.player.unpause();
+  const queue = player.nodes.get(message.guild);
+  if (!queue || !queue.node.isPlaying())
+    return message.reply("No song is currently playing.");
+  queue.node.setPaused(false);
   message.reply("▶ Music resumed!");
 }
 
+// Stop
 export function stopMusic(message) {
-  const queue = guildQueues.get(message.guild.id);
+  const queue = player.nodes.get(message.guild);
   if (!queue) return message.reply("No song is currently playing.");
-  queue.player.stop();
-  queue.connection.destroy();
-  guildQueues.delete(message.guild.id);
-  message.reply("⏹ Music stopped and disconnected.");
+  queue.delete();
+  message.reply("⏹ Music stopped and queue cleared.");
 }
 
-// Skip current song
+// Skip
 export function skipMusic(message) {
-  const queue = guildQueues.get(message.guild.id);
-  if (!queue || queue.songs.length === 0) return message.reply("No song to skip.");
-  queue.player.stop(); // triggers playNext automatically
+  const queue = player.nodes.get(message.guild);
+  if (!queue || !queue.node.isPlaying())
+    return message.reply("No song is currently playing.");
+  queue.node.skip();
   message.reply("⏭ Song skipped!");
 }
 
-// Show current queue
+// Show Queue
 export function showQueue(message) {
-  const queue = guildQueues.get(message.guild.id);
-  if (!queue || queue.songs.length === 0) return message.reply("Queue is empty.");
-  const list = queue.songs.map((s, i) => `${i + 1}. ${s.title}`).join("\n");
+  const queue = player.nodes.get(message.guild);
+  if (!queue || !queue.tracks.length)
+    return message.reply("Queue is empty.");
+  const list = queue.tracks
+    .map((t, i) => `${i + 1}. ${t.title} (${t.duration})`)
+    .join("\n");
   message.reply(`📜 Current Queue:\n${list}`);
 }
