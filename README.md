@@ -1,7 +1,7 @@
 # EpiBot
 All-in-one discord bot
 
-## Commands
+## Commands:
 ### 🎵 Music Bot Commands
 | Command | Description |
 |---------|-------------|
